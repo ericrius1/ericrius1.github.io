@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset='utf-8'>
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <link href='https://fonts.googleapis.com/css?family=Chivo:900' rel='stylesheet' type='text/css'>
+    <link rel="stylesheet" type="text/css" href="stylesheets/stylesheet.css" media="screen" />
+    <link rel="stylesheet" type="text/css" href="stylesheets/pygment_trac.css" media="screen" />
+    <link rel="stylesheet" type="text/css" href="stylesheets/print.css" media="print" />
+    <script src="http://code.jquery.com/jquery-1.10.1.min.js"></script>
+    <script src="javascripts/jquery.js"></script>
+    <script src="javascripts/World.js"></script>
+    <script src="javascripts/ContentController.js"></script>
+    <script id="shader-vs" type="x-shader/x-vertex"> 
+ 
+  attribute vec3 aPos;
+  attribute vec2 aTexCoord;
+  varying   vec2 uv;
+  varying vec2 uv_orig;
+  void main(void) {
+   gl_Position = vec4(aPos.x, aPos.y, aPos.z, 1.0);
+   uv = aTexCoord;
+   uv_orig = uv;
+}
+</script>
+
+<script id="shader-fs-inc" type="x-shader/x-fragment">
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+varying vec2 uv;
+varying vec2 uv_orig;
+
+
+
+vec2 encode(float v){
+  vec2 c = vec2(0.);
+
+  int signum = (v >= 0.) ? 128 : 0;
+  v = abs(v);
+  int exponent = 15;
+  float limit = 64.; // considering the bias from 2^-9 to 2^6 (==64)
+  for(int exp = 15; exp > 0; exp--){
+    if( v < limit){
+      limit /= 2.;
+      exponent--;
+    }
+  }
+
+  float rest;
+  if(exponent == 0){
+    rest = v / limit / 2.;    // "subnormalize" implicite preceding 0. 
+  }else{
+    rest = (v - limit)/limit;   // normalize accordingly to implicite preceding 1.
+  }
+
+  //lower this value for finger painting 
+  int mantissa = int(rest * 2048.); // 2048 = 2^11 for the (split) 11 bit mantissa
+  int msb = mantissa / 256;     // the most significant 3 bits go into the lower part of the first byte
+  int lsb = mantissa - msb * 256;   // there go the other 8 bit of the lower significance
+
+  c.x = float(signum + exponent * 8 + msb) / 255.;  
+  c.y = float(lsb) / 255.;              // ^^ ...same weird color normalization for texture2D here
+
+  if(v >= 2048.){
+    //c.x = float( 128. + float(signum)) / 256.;
+    c.y = 1.;
+  }
+
+  return c;
+}
+
+float decode(vec2 c){
+  float v = 0.;
+
+  int ix = int(c.x*255.); // 1st byte: 1 bit signum, 4 bits exponent, 3 bits mantissa (MSB)
+  int iy = int(c.y*255.); // 2nd byte: 8 bit mantissa (LSB)
+
+  int s = (c.x >= 0.5) ? 1 : -1;
+  ix = (s > 0) ? ix - 128 : ix; // remove the signum bit from exponent
+  int iexp = ix / 8; // cut off the last 3 bits of the mantissa to select the 4 exponent bits
+  int msb = ix - iexp * 8;  // subtract the exponent bits to select the 3 most significant bits of the mantissa
+
+  int norm = (iexp == 0) ? 0 : 2048; // distinguish between normalized and subnormalized numbers
+  int mantissa = norm + msb * 256 + iy; // implicite preceding 1 or 0 added here
+  norm = (iexp == 0) ? 1 : 0; // normalization toggle
+  float exponent = pow( 2., float(iexp + norm) - 20.); // -9 for the the exponent bias from 2^-9 to 2^6 plus another -11 for the normalized 12 bit mantissa 
+  v = float( s * mantissa ) * exponent;
+
+  return v;
+}
+
+vec4 encode2(vec2 v){
+  return vec4( encode(v.x), encode(v.y) );
+}
+    
+vec2 decode2(vec4 c){
+  return vec2( decode(c.rg), decode(c.ba) );
+}
+
+bool is_onscreen(vec2 uv){
+  return (uv.x < 1.) && (uv.x > 0.) && (uv.y < 1.) && (uv.y > 0.);
+}
+
+float border(vec2 uv, float border, vec2 texSize){
+  uv*=texSize;
+  return (uv.x<border || uv.x>texSize.x-border || uv.y<border || uv.y >texSize.y-border) ? 1.:.0;
+}
+</script>
+
+
+
+
+<script id="shader-fs-copy" type="x-shader/x-fragment"> 
+uniform sampler2D source;
+void main(void) {
+  gl_FragColor = texture2D(source, uv);
+}
+</script>
+
+<script id="shader-fs-init" type="x-shader/x-fragment"> 
+void main(void){
+  gl_FragColor = encode2(vec2(0.));
+}
+</script>
+
+<script id="shader-fs-advance" type="x-shader/x-fragment"> 
+  uniform sampler2D sampler_prev;
+  uniform sampler2D sampler_prev_n;
+  uniform sampler2D sampler_blur;
+  uniform sampler2D sampler_blur2;
+  uniform sampler2D sampler_blur3;
+  uniform sampler2D sampler_blur4;
+  uniform sampler2D sampler_blur5;
+  uniform sampler2D sampler_blur6;
+  uniform sampler2D sampler_noise;
+  uniform sampler2D sampler_noise_n;
+  uniform sampler2D sampler_fluid;
+
+  uniform vec4 rnd;
+  uniform vec4 rainbow;
+  uniform vec2 pixelSize;
+  uniform vec2 aspect;
+  uniform vec2 mouse;
+  uniform vec2 mouseV;
+  uniform float fps;
+  uniform float time;
+
+void main(void) {
+  vec2 motion = decode2( texture2D(sampler_fluid, uv))*pixelSize*0.75;
+
+  vec2 uv = uv - motion; // add fluid motion
+  vec4 noise = texture2D(sampler_noise, uv_orig + rnd.xy)-0.5; 
+ 
+  gl_FragColor.y = texture2D(sampler_prev, uv).y + noise.y*1./256.;
+  gl_FragColor.y += (texture2D(sampler_prev, uv).y-texture2D(sampler_blur5, uv).y)*1./64.;
+  
+  vec2 d = pixelSize*8.;
+  vec2 gy; // gradient in green
+  gy.x = texture2D(sampler_blur2, uv_orig-vec2(1.,0.)*d).y - texture2D(sampler_blur2, uv_orig+vec2(1.,0.)*d).y;
+  gy.y = texture2D(sampler_blur2, uv_orig-vec2(0.,1.)*d).y - texture2D(sampler_blur2, uv_orig+vec2(0.,1.)*d).y;
+
+  d = pixelSize*4.;
+  vec2 gz; // gradient in blue
+  gz.x = texture2D(sampler_blur, uv_orig-vec2(1.,0.)*d).z - texture2D(sampler_blur, uv_orig+vec2(1.,0.)*d).z;
+  gz.y = texture2D(sampler_blur, uv_orig-vec2(0.,1.)*d).z - texture2D(sampler_blur, uv_orig+vec2(0.,1.)*d).z;
+
+  uv = uv_orig - motion + gz.yx*vec2(-1.,1.)*pixelSize*2.0;
+
+  gl_FragColor.z = texture2D(sampler_prev, uv).z;
+  gl_FragColor.z += (texture2D(sampler_prev, uv).z-texture2D(sampler_blur3, uv).z)*28./256.;
+
+  gl_FragColor.z +=  - (gl_FragColor.y-0.255)*1./128.;
+
+  vec2 gx; // gradient in blue
+  gx.x = texture2D(sampler_blur, uv_orig-vec2(1.,0.)*d).x - texture2D(sampler_blur, uv_orig+vec2(1.,0.)*d).x;
+  gx.y = texture2D(sampler_blur, uv_orig-vec2(0.,1.)*d).x - texture2D(sampler_blur, uv_orig+vec2(0.,1.)*d).x;
+
+  uv =  uv_orig - motion - gx.yx*vec2(-1.,1.)*pixelSize*2.;
+
+  gl_FragColor.x = texture2D(sampler_prev, uv).x;
+  gl_FragColor.x += (texture2D(sampler_prev, uv).x-texture2D(sampler_blur3, uv).x)*28./256.;
+
+  gl_FragColor.x +=  - (0.745-gl_FragColor.y)*1./128.;
+  gl_FragColor.a = 1.;
+}
+</script>
+
+<script id="shader-fs-composite" type="x-shader/x-fragment"> 
+  uniform sampler2D sampler_prev;
+  uniform sampler2D sampler_prev_n;
+  uniform sampler2D sampler_blur;
+  uniform sampler2D sampler_blur2;
+  uniform sampler2D sampler_blur3;
+  uniform sampler2D sampler_blur4;
+  uniform sampler2D sampler_blur5;
+  uniform sampler2D sampler_blur6;
+  uniform sampler2D sampler_noise;
+  uniform sampler2D sampler_noise_n;
+  uniform sampler2D sampler_fluid;
+  uniform sampler2D sampler_fluid_p;
+
+  uniform vec4 rnd;
+  uniform vec4 rainbow;
+  uniform vec2 pixelSize;
+  uniform vec2 aspect;
+  uniform vec2 mouse;
+  uniform vec2 mouseV;
+  uniform float fps;
+  uniform float time;
+
+void main(void) {
+  gl_FragColor = vec4(1.-abs(texture2D(sampler_prev, uv).y*2.-1.));
+
+  vec2 d = pixelSize*1.;
+  vec2 gy; // green uv gradient vector
+  gy.x = texture2D(sampler_prev, uv-vec2(1.,0.)*d).y - texture2D(sampler_prev, uv+vec2(1.,0.)*d).y;
+  gy.y = texture2D(sampler_prev, uv-vec2(0.,1.)*d).y - texture2D(sampler_prev, uv+vec2(0.,1.)*d).y;
+
+  d = pixelSize*4.;
+
+  vec2 gz; // blue blur2 gradient vector
+  gz.x += texture2D(sampler_blur2, uv-vec2(1.,0.)*d).z - texture2D(sampler_blur2, uv+vec2(1.,0.)*d).z;
+  gz.y += texture2D(sampler_blur2, uv-vec2(0.,1.)*d).z - texture2D(sampler_blur2, uv+vec2(0.,1.)*d).z;
+
+  gl_FragColor = vec4(0.);
+
+  gl_FragColor.y = texture2D(sampler_prev, uv + gz*pixelSize*64.).y*0.4 - (gz.x + gz.y)*0.4 + 0.4;
+  gl_FragColor.z = texture2D(sampler_blur4, uv + 80.*pixelSize*gy - gz ).z*1.75 -0.0;
+
+  gl_FragColor.yz *= 1.- texture2D(sampler_blur4, uv).x*2.5;
+  gl_FragColor.x = texture2D(sampler_prev, uv).x*1.+0.25;
+  
+  gl_FragColor.y += gl_FragColor.x;
+
+  gl_FragColor.yz *= vec2(0.75,1.)- texture2D(sampler_blur4, uv).z*1.5;
+  gl_FragColor.z += texture2D(sampler_prev, uv).z*1.5;
+  gl_FragColor.y += gl_FragColor.z*0.5 - 0.1;
+
+  
+
+  gl_FragColor.a = 1.;
+}
+</script>
+
+<script id="shader-fs-blur-horizontal" type="x-shader/x-fragment">
+// original shader from http://www.gamerendering.com/2008/10/11/gaussian-blur-filter-shader/
+// horizontal blur fragment shader
+uniform sampler2D src_tex;
+uniform vec2 pixelSize;
+
+
+void main(void) // fragment
+{
+  float h = pixelSize.x;
+  vec4 sum = vec4(0.0);
+  sum += texture2D(src_tex, vec2(uv.x - 4.0*h, uv.y) ) * 1.05;
+  sum += texture2D(src_tex, vec2(uv.x - 3.0*h, uv.y) ) * 0.09;
+  sum += texture2D(src_tex, vec2(uv.x - 2.0*h, uv.y) ) * 0.12;
+  sum += texture2D(src_tex, vec2(uv.x - 1.0*h, uv.y) ) * 0.15;
+  sum += texture2D(src_tex, vec2(uv.x + 0.0*h, uv.y) ) * 0.16;
+  sum += texture2D(src_tex, vec2(uv.x + 1.0*h, uv.y) ) * 0.15;
+  sum += texture2D(src_tex, vec2(uv.x + 2.0*h, uv.y) ) * 0.12;
+  sum += texture2D(src_tex, vec2(uv.x + 3.0*h, uv.y) ) * 0.09;
+  sum += texture2D(src_tex, vec2(uv.x + 4.0*h, uv.y) ) * 0.05;
+    gl_FragColor.xyz = sum.xyz/0.98; // normalize
+  gl_FragColor.a = 1.;
+} 
+</script>
+
+<script id="shader-fs-blur-vertical" type="x-shader/x-fragment">
+uniform sampler2D src_tex;
+uniform vec2 pixelSize;
+
+void main(void) // fragment
+{
+  float v = pixelSize.y;
+  vec4 sum = vec4(0.0);
+  sum += texture2D(src_tex, vec2(uv.x, - 4.0*v + uv.y) ) * 0.05;
+  sum += texture2D(src_tex, vec2(uv.x, - 3.0*v + uv.y) ) * 0.09;
+  sum += texture2D(src_tex, vec2(uv.x, - 2.0*v + uv.y) ) * 0.12;
+  sum += texture2D(src_tex, vec2(uv.x, - 1.0*v + uv.y) ) * 0.15;
+  sum += texture2D(src_tex, vec2(uv.x, + 0.0*v + uv.y) ) * 0.16;
+  sum += texture2D(src_tex, vec2(uv.x, + 1.0*v + uv.y) ) * 0.15;
+  sum += texture2D(src_tex, vec2(uv.x, + 2.0*v + uv.y) ) * 0.12;
+  sum += texture2D(src_tex, vec2(uv.x, + 3.0*v + uv.y) ) * 0.09;
+  sum += texture2D(src_tex, vec2(uv.x, + 4.0*v + uv.y) ) * 0.05;
+    gl_FragColor.xyz = sum.xyz/0.98;
+  gl_FragColor.a = 1.;
+}
+</script>
+
+<script id="shader-fs-add-mouse-motion" type="x-shader/x-fragment"> 
+uniform sampler2D sampler_fluid;
+
+uniform vec2 aspect;
+uniform vec2 mouse; // mouse coordinate
+uniform vec2 mouseV; // mouse velocity
+uniform vec2 pixelSize;
+uniform vec2 texSize;
+
+float mouseFilter(vec2 uv){
+  return clamp( 1.-length((uv-mouse)*texSize)/8., 0. , 1.);
+}
+
+void main(void){
+  vec2 v = decode2(texture2D(sampler_fluid, uv));
+
+  if(length(mouseV) > 0.)
+    v = mix(v, mouseV*2., mouseFilter(uv)*0.85);
+
+  gl_FragColor = encode2(v);
+}
+
+</script>
+
+<script id="shader-fs-advect" type="x-shader/x-fragment"> 
+uniform vec2 texSize;
+uniform vec2 pixelSize;
+
+  uniform sampler2D sampler_fluid;
+
+  const float dt = .001;
+
+void main(void){
+  vec2 v = decode2(texture2D(sampler_fluid, uv));
+
+  vec2 D = -texSize*vec2(v.x, v.y)*dt;
+
+   vec2 Df = floor(D),   Dd = D - Df;
+   vec2 uv = uv + Df*pixelSize;
+
+  vec2 uv0, uv1, uv2, uv3;
+
+  uv0 = uv + pixelSize*vec2(0.,0.);
+  uv1 = uv + pixelSize*vec2(1.,0.);
+  uv2 = uv + pixelSize*vec2(0.,1.);
+  uv3 = uv + pixelSize*vec2(1.,1.);
+
+  vec2 v0 = decode2( texture2D(sampler_fluid, uv0));
+  vec2 v1 = decode2( texture2D(sampler_fluid, uv1));
+  vec2 v2 = decode2( texture2D(sampler_fluid, uv2));
+  vec2 v3 = decode2( texture2D(sampler_fluid, uv3));
+
+  v = mix( mix( v0, v1, Dd.x), mix( v2, v3, Dd.x), Dd.y);
+
+  gl_FragColor = encode2(v*(1.-border(uv, 1., texSize)));
+}
+
+</script>
+
+<script id="shader-fs-p" type="x-shader/x-fragment"> 
+uniform vec2 pixelSize;
+uniform vec2 texSize;
+uniform sampler2D sampler_v;
+uniform sampler2D sampler_p;
+  const float h = 1./1024.;
+
+void main(void){
+
+  vec2 v = decode2(texture2D(sampler_v, uv));
+  float v_x = decode(texture2D(sampler_v, uv - vec2(1.,0.)*pixelSize).rg);
+  float v_y = decode(texture2D(sampler_v, uv - vec2(0.,1.)*pixelSize).ba);
+
+  float n = decode(texture2D(sampler_p, uv- pixelSize*vec2(0.,1.)).rg);
+  float w = decode(texture2D(sampler_p, uv + pixelSize*vec2(1.,0.)).rg);
+  float s = decode(texture2D(sampler_p, uv + pixelSize*vec2(0.,1.)).rg);
+  float e = decode(texture2D(sampler_p, uv - pixelSize*vec2(1.,0.)).rg);
+
+  float p = ( n + w + s + e - (v.x - v_x + v.y - v_y)*h ) * .25;
+
+  gl_FragColor.rg = encode(p);
+  gl_FragColor.ba = vec2(0.); // unused
+}
+</script>
+
+<script id="shader-fs-div" type="x-shader/x-fragment"> 
+uniform vec2 texSize;
+uniform vec2 pixelSize;
+uniform sampler2D sampler_v;
+uniform sampler2D sampler_p;
+
+void main(void){
+  float p = decode(texture2D(sampler_p, uv).rg);
+  vec2 v = decode2(texture2D(sampler_v, uv));
+  float p_x = decode(texture2D(sampler_p, uv + vec2(1.,0.)*pixelSize).rg);
+  float p_y = decode(texture2D(sampler_p, uv + vec2(0.,1.)*pixelSize).rg);
+
+  v -= (vec2(p_x, p_y)-p)*512.;
+
+  gl_FragColor = encode2(v);
+}
+</script>
+
+<script type="text/javascript">
+  function load(){
+
+    var world = new World();
+
+  }
+</script>
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <title>Eric Levin</title>
+     <script>
+    (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+    (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+    m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+    })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+
+    ga('create', 'UA-41019562-2', 'ericrius1.github.io');
+    ga('send', 'pageview');
+
+    </script>
+  </head>
+
+  <body onload = load()>
+    <canvas id="canvas" style="z-index:-1"></canvas>
+    <div id = "name">Eric Levin</div>
+    <div id="container">
+      <div class="inner">
+
+        <h4>
+          <a href = "http://ericrius1.github.io/ComeDownToUs">Come Down To Us</a>
+          <p> A threejs sunset jam of Burial's aweosome "Come Down To Us"</p>
+
+        <h4>
+          <a href = "http://ericrius1.github.io/PlatosCave">Plato's Cave</a>
+          <p> Explore and shoot fireworks in a mystical starry ocean land</p>
+        </h4>
+        </h4>
+        <h4>
+          <a href = "http://ericrius1.github.io/IndrasNet/public">Indra's Net</a>
+          <p> An interactive 3D visualization of the Buddhist/Jedi concept of interdependence and interpenetration. View in Google Chrome. </p>
+          <a href="http://www.chromeexperiments.com/detail/indras-net/"><img src="images/badge.png" alt="See my Experiment on ChromeExperiments.com" /></a>
+        </h4>
+        <h4>
+          <a href = "http://ericrius1.github.io/PhotoVis/">FacebookPhotoMusical</a>
+          <p> A 3D music visualizer incorporating your facebook photos! View in Google Chrome. </p>
+        </h4>
+
+
+
+      </div>
+    </div>
+
+   
+
+  </body>
+</html>
