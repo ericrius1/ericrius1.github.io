@@ -58,14 +58,26 @@ body {
 
 
 #name {
-   margin-left: 2%;
+   margin-left: 30px;
+   margin-top: 10px;
    font-family: Arial, serif; font-weight: 900;
    cursor: pointer; 
    color: orange;
-   display: inline;
    font-size: 3em;
    -webkit-transition: text-shadow 1s linear;
    transition: text-shadow 1s linear;
+}
+
+#email{
+  margin-left: 34px;
+  margin-top: -11px;
+  font-family: Arial, serif; font-weight: 900;
+  cursor: pointer; 
+  color: orange;
+  font-size: 1em;
+  -webkit-transition: text-shadow 1s linear;
+  transition: text-shadow 1s linear;
+
 }
 #name.glow{
   text-shadow: 0 0 20px white;
